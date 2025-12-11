@@ -38,16 +38,7 @@ class PropellantInput:
                          fuel_temp: float) -> Tuple[Dict[str, float], float]:
         """
         Calculates elemental moles per kg (b0) and mixture enthalpy (H0/R).
-
-        Args:
-            oxidizer: Name of oxidizer species in DB (e.g., "O2").
-            fuel: Name of fuel species in DB (e.g., "H2").
-            of_ratio: Oxidizer-to-Fuel mass ratio.
-            ox_temp: Temperature of oxidizer inlet (K).
-            fuel_temp: Temperature of fuel inlet (K).
-
-        Returns:
-            Tuple (b0_dict, h0_r_mix)
+        Now includes temperature clamping to avoid polynomial extrapolation errors.
         """
         # 1. Get properties of reactants
         ox_spec = self.db.species.get(oxidizer)
@@ -56,39 +47,40 @@ class PropellantInput:
         if not ox_spec or not fuel_spec:
             raise ValueError(f"Reactants {oxidizer} or {fuel} not found in DB.")
 
-        # 2. Calculate Enthalpies (H/RT -> H_spec [J/kg])
-        # h_spec = (H/RT) * R_univ * T / MW
+        # --- FIX: Clamp temperatures to valid range ---
+        # Gas polynomials usually start at 200K. Using 20K or 90K crashes calculation.
+        # We use the lowest t_min from the species data.
 
+        real_ox_temp = max(ox_temp, ox_spec.intervals[0].t_min)
+        if real_ox_temp > ox_temp:
+            print(f"WARNING: Oxidizer T={ox_temp}K is below data range. Using T={real_ox_temp}K.")
+
+        real_fuel_temp = max(fuel_temp, fuel_spec.intervals[0].t_min)
+        if real_fuel_temp > fuel_temp:
+            print(f"WARNING: Fuel T={fuel_temp}K is below data range. Using T={real_fuel_temp}K.")
+
+        # 2. Calculate Enthalpies using SAFE temperatures
         # Oxidizer
-        _, h_rt_ox, _, _ = ox_spec.get_properties(ox_temp)
-        h_ox_per_kg = (h_rt_ox * R_UNIV * ox_temp) / ox_spec.molecular_weight
+        _, h_rt_ox, _, _ = ox_spec.get_properties(real_ox_temp)
+        h_ox_per_kg = (h_rt_ox * R_UNIV * real_ox_temp) / ox_spec.molecular_weight
 
         # Fuel
-        _, h_rt_fu, _, _ = fuel_spec.get_properties(fuel_temp)
-        h_fu_per_kg = (h_rt_fu * R_UNIV * fuel_temp) / fuel_spec.molecular_weight
+        _, h_rt_fu, _, _ = fuel_spec.get_properties(real_fuel_temp)
+        h_fu_per_kg = (h_rt_fu * R_UNIV * real_fuel_temp) / fuel_spec.molecular_weight
 
         # 3. Mixture Enthalpy (per kg)
-        # H_mix = (m_ox * h_ox + m_fu * h_fu) / (m_ox + m_fu)
-        # using m_ox = O/F, m_fu = 1
         total_mass = of_ratio + 1.0
         h_mix_per_kg = (of_ratio * h_ox_per_kg + 1.0 * h_fu_per_kg) / total_mass
 
-        # Convert to solver input format: H0/R [K/kg] ? 
-        # Solver expects Val_1 = H0/R (units of Temperature per unit mass basis? No.)
-        # In equilibrium.py: h0_rt_target = val_1 / current_T
-        # RHS Enthalpy term is dimensionless sum(nj * H/RT). nj is kmol/kg.
-        # So sum(nj * H/RT) * RT = Enthalpy_J_per_kg.
-        # Therefore, H0/R should be (Enthalpy_J_per_kg / R_univ).
-        # Check units: [J/kg] / [J/kmol*K] = [kmol*K / kg].
-        # Correct.
+        # H0/R [K * kmol / kg]
         h0_r_mix = h_mix_per_kg / R_UNIV
 
-        # 4. Elemental Composition (b0: kmol_element / kg_mix)
+        # 4. Elemental Composition (b0)
         b0 = {}
 
-        # Helper to add atoms
         def add_atoms(spec, mass_frac, temp_b0):
-            moles_spec_per_kg = mass_frac / spec.molecular_weight  # kmol/kg
+            # spec.molecular_weight is in kg/kmol (numerically equal to g/mol)
+            moles_spec_per_kg = mass_frac / spec.molecular_weight
             for el, count in spec.composition.items():
                 temp_b0[el] = temp_b0.get(el, 0.0) + count * moles_spec_per_kg
 

@@ -16,6 +16,8 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 
+from constants import R_UNIV
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger("CEA_Solver")
@@ -45,7 +47,7 @@ class EquilibriumSolver:
             thermo_db: An instance of ThermoDatabase containing species data.
         """
         self.db = thermo_db
-        self.MAX_ITER = 100
+        self.MAX_ITER = 1000
         self.TOLERANCE = 1e-5
 
         # Trace limit for species moles. 
@@ -117,8 +119,11 @@ class EquilibriumSolver:
 
             # Solver Loop
             for iteration in range(self.MAX_ITER):
+                # --- Debug output every 50 iterations ---
+                if iteration % 50 == 0 and iteration > 0:
+                    logger.info(f"Iter {iteration}: T={current_T:.1f} K")
 
-                # 2. Calculate Thermodynamic Properties
+                # 2. Thermodynamic Properties
                 h_rt_vec = np.zeros(n_species)
                 s_r_vec = np.zeros(n_species)
                 cp_r_vec = np.zeros(n_species)
@@ -246,8 +251,8 @@ class EquilibriumSolver:
                 # 6. Convergence Control
                 lambda_f = 1.0
                 if is_energy_constrained:
-                    if abs(dln_t_update) > 0.2:
-                        lambda_f = min(lambda_f, 0.2 / abs(dln_t_update))
+                    if abs(dln_t_update) > 0.5:
+                        lambda_f = min(lambda_f, 0.5 / abs(dln_t_update))
 
                 max_dln_nj = np.max(np.abs(dln_nj))
                 if max_dln_nj > 2.0:
@@ -259,6 +264,8 @@ class EquilibriumSolver:
                 if is_energy_constrained:
                     ln_T += lambda_f * dln_t_update
                     current_T = np.exp(ln_T)
+                    # Safety clamp T
+                    current_T = max(200.0, min(current_T, 10000.0))
 
                 nj = np.exp(ln_nj)
                 total_n = np.exp(ln_n)
@@ -268,95 +275,50 @@ class EquilibriumSolver:
 
                     logger.info(f"Converged in {iteration} iterations. T={current_T:.2f} K")
 
-                    # Критерий появления: (Sum(aij * pi_i) - G_j/RT) > Tolerance
-                    # Это означает, что химический потенциал элементов в газе выше,
-                    # чем потенциал чистого конденсата -> конденсат должен образоваться.
-
-                    # pi_update содержит значения множителей Лагранжа (pi_i) для текущей итерации
+                    # Check Condensed Phases
                     current_pi = pi_update
-
                     max_violation = 0.0
                     best_candidate = None
 
-                    # Проходим по всем веществам в базе данных
                     for name, sp in self.db.species.items():
-                        if name in init_species:
-                            continue  # Уже в расчете
-
-                        # Эвристика: проверяем только вещества с (L), (S), (cr) в имени
-                        # или если бы у нас был флаг sp.phase == 'condensed'
-                        if not any(x in name for x in ['(L)', '(S)', '(cr)', '(s)', '(l)']):
-                            continue
-
-                        # Проверяем, состоит ли вещество только из доступных элементов
+                        if name in init_species: continue
+                        if not any(x in name for x in ['(L)', '(S)', '(cr)', '(s)', '(l)']): continue
                         sp_elements = set(sp.composition.keys())
-                        if not sp_elements.issubset(set(element_list)):
-                            continue
+                        if not sp_elements.issubset(set(element_list)): continue
 
-                        # Считаем свойства кандидата при текущей T
                         try:
                             _, _, _, g_rt_cand = sp.get_properties(current_T)
                         except ValueError:
-                            continue  # Вне температурного диапазона
+                            continue
 
-                        # Считаем потенциал из элементов: Sum(aij * pi_i)
                         pot_elements = 0.0
                         for i, el in enumerate(element_list):
                             pot_elements += sp.composition.get(el, 0.0) * current_pi[i]
 
-                        # Критерий: (Potential_Elements - G_solid) > 0
                         violation = pot_elements - g_rt_cand
-
                         if violation > max_violation:
                             max_violation = violation
                             best_candidate = name
 
-                    # Если нашли кандидата с существенным нарушением равновесия
                     if best_candidate and max_violation > 1e-4:
-                        logger.info(f"Adding condensed phase: {best_candidate} (Violation: {max_violation:.4e})")
+                        logger.info(f"Adding condensed phase: {best_candidate}")
                         init_species.append(best_candidate)
-                        # ПЕРЕЗАПУСК внешнего цикла (while True), чтобы пересчитать с новым веществом
-                        break
+                        break  # Break inner loop, continue while True
 
-                    # Если конденсатов не найдено, выходим из цикла перезапуска и возвращаем результат
-
-                    # 7. Post-Processing: Derivatives
-                    # -------------------------------
-                    # Считаем производные (Sound Speed, Gamma, Cp)
-                    props = self._calculate_derivatives(
-                        species_objs,
-                        nj,
-                        current_T,
-                        P,
-                        total_n,
-                        cp_r_vec,  # Вектор Cp/R (уже посчитан в цикле)
-                        h_rt_vec  # Вектор H/RT (уже посчитан в цикле)
-                    )
-
-                    # Добавляем базовые свойства
+                    # Final Result
+                    props = self._calculate_derivatives(species_objs, nj, current_T, P, total_n, cp_r_vec, h_rt_vec)
                     props["s_total_r"] = np.dot(nj, s_r_vec) / total_n
 
-                    # Фильтруем следовые количества для чистого вывода
                     final_mole_fractions = {}
                     for j, sp in enumerate(species_objs):
                         if nj[j] / total_n > self.TRACE_LIMIT:
                             final_mole_fractions[sp.name] = nj[j] / total_n
 
-                    return EquilibriumResult(
-                        P=P,
-                        T=current_T,
-                        mole_fractions=final_mole_fractions,
-                        properties=props,
-                        converged=True,
-                        iterations=iteration
-                    )
+                    return EquilibriumResult(P, current_T, final_mole_fractions, props, True, iteration)
 
-            # --- Конец цикла for (indentation level: внутри while) ---
-            # Этот блок else относится к циклу FOR.
-            # Он выполнится только если цикл закончился сам (MAX_ITER), не встретив break.
-            else:
-                logger.error("Max iterations reached.")
-                return None
+                else:
+                    logger.error("Max iterations reached.")
+                    return None
 
     def _calculate_derivatives(self,
                                species_objs: List[Any],
