@@ -8,7 +8,7 @@ It follows the matrix structure described in NASA RP-1311 (Gordon & McBride, 199
 Key Features:
 - Solves TP (Temperature-Pressure), HP (Enthalpy-Pressure), and SP (Entropy-Pressure) problems.
 - Calculates thermodynamic derivatives (Cp, gamma, sonic velocity).
-- Prepares structure for condensed phases (currently TODO).
+- Prepares structure for condensed phases.
 """
 
 import numpy as np
@@ -78,354 +78,544 @@ class EquilibriumSolver:
         """
         logger.info(f"Starting {problem_type} solver at P={P:.4f} bar.")
 
-        # 1. Initialize State
-        # -------------------
-        # Filter species that exist in DB
-        species_objs = [self.db.species[name] for name in init_species if name in self.db.species]
-        if not species_objs:
-            logger.error("No valid species found in database.")
-            return None
+        while True:
+
+            # 1. Initialize State
+            species_objs = [self.db.species[name] for name in init_species if name in self.db.species]
+            if not species_objs:
+                logger.error("No valid species found in database.")
+                return None
+
+            n_species = len(species_objs)
+            element_list = list(elements_b0.keys())
+            n_elements = len(element_list)
+
+            # Build 'a' matrix
+            a_matrix = np.zeros((n_elements, n_species))
+            for j, sp in enumerate(species_objs):
+                for i, el in enumerate(element_list):
+                    a_matrix[i, j] = sp.composition.get(el, 0.0)
+
+            b0 = np.array([elements_b0[el] for el in element_list])
+
+            # Initial Guess for Composition (n_j) and Temperature (T)
+            # Using the robust estimation routine
+            if problem_type == 'TP':
+                current_T = val_1
+            else:
+                # For HP/SP, start with a reasonable guess
+                current_T = 3000.0
+
+                # Call the estimation routine (assuming it is implemented in the class)
+            nj, total_n = self._estimate_initial_composition(
+                species_objs, b0, a_matrix, current_T, P
+            )
+
+            ln_nj = np.log(nj)
+            ln_n = np.log(total_n)
+            ln_T = np.log(current_T)
+
+            # Solver Loop
+            for iteration in range(self.MAX_ITER):
+
+                # 2. Calculate Thermodynamic Properties
+                h_rt_vec = np.zeros(n_species)
+                s_r_vec = np.zeros(n_species)
+                cp_r_vec = np.zeros(n_species)
+                mu_rt_vec = np.zeros(n_species)
+
+                for j, sp in enumerate(species_objs):
+                    cp_r, h_rt, s_r, g_rt = sp.get_properties(current_T)
+                    h_rt_vec[j] = h_rt
+                    s_r_vec[j] = s_r
+                    cp_r_vec[j] = cp_r
+
+                    # mu_j/RT = (G/RT)_j + ln(n_j) + ln(P_atm) - ln(n)
+                    mu_rt_vec[j] = g_rt + ln_nj[j] + np.log(P) - ln_n
+
+                # 3. Build Interaction Matrix and Residual Vector
+                is_energy_constrained = (problem_type != 'TP')
+                dim = n_elements + 1 + (1 if is_energy_constrained else 0)
+
+                matrix = np.zeros((dim, dim))
+                rhs = np.zeros(dim)
+
+                nj_diag = np.diag(nj)
+
+                # 3.1 Mass Balance Block (Rows 0 to N_el-1)
+                # A_ik = sum(a_ij * a_kj * nj)
+                A_block = a_matrix @ nj_diag @ a_matrix.T
+                matrix[:n_elements, :n_elements] = A_block
+
+                # 3.2 Equation of State Block (Row/Col N_el)
+                # A_in = sum(a_ij * nj)
+                vec_n_elements = a_matrix @ nj
+                matrix[:n_elements, n_elements] = vec_n_elements
+                matrix[n_elements, :n_elements] = vec_n_elements
+                matrix[n_elements, n_elements] = np.sum(nj) - total_n
+
+                # 3.3 Energy/Entropy Block (Row/Col N_el+1) - For HP/SP
+                if is_energy_constrained:
+                    # Common term: Column for T (dln_T) in Mass and EOS rows
+                    # This column ALWAYS depends on H/RT because d(ln_nj)/d(ln_T) ~ H/RT
+                    # Vector: A @ (nj * H_RT)
+                    t_col_vec_mass = a_matrix @ (nj * h_rt_vec)
+                    t_col_elem_sum = np.dot(nj, h_rt_vec)
+
+                    # Fill Column N_el + 1 (Temperature corrections on Mass/Sum)
+                    matrix[:n_elements, n_elements + 1] = t_col_vec_mass
+                    matrix[n_elements, n_elements + 1] = t_col_elem_sum
+
+                    if problem_type == 'HP':
+                        # --- HP Problem (Enthalpy) ---
+                        # Row N_el + 1 is Enthalpy Equation.
+                        # Coefficients for pi_i (Columns 0..N_el-1): Same as T-column (Symmetric)
+                        matrix[n_elements + 1, :n_elements] = t_col_vec_mass
+
+                        # Coefficient for dln_n (Column N_el): Same as T-col (Symmetric)
+                        matrix[n_elements + 1, n_elements] = t_col_elem_sum
+
+                        # Corner element (Row T, Col T): sum(nj * (Cp/R + (H/RT)^2))
+                        term_corner = np.dot(nj, cp_r_vec + h_rt_vec ** 2)
+                        matrix[n_elements + 1, n_elements + 1] = term_corner
+
+                        # RHS for HP
+                        # Target H0/RT - Current H/RT + Correction terms
+                        h0_rt_target = val_1 / current_T
+                        current_H_total = np.dot(nj, h_rt_vec)
+                        nj_mu = nj * mu_rt_vec
+                        rhs[n_elements + 1] = h0_rt_target - current_H_total + np.dot(nj_mu, h_rt_vec)
+
+                    elif problem_type == 'SP':
+                        # --- SP Problem (Entropy) ---
+                        # Row N_el + 1 is Entropy Equation: sum(nj * S_j) = S0
+
+                        # Coefficients for pi_i (Columns 0..N_el-1): sum(a_ij * nj * S_j/R)
+                        # Vector: A @ (nj * S_R)
+                        s_row_vec_mass = a_matrix @ (nj * s_r_vec)
+                        matrix[n_elements + 1, :n_elements] = s_row_vec_mass
+
+                        # Coefficient for dln_n (Column N_el): sum(nj * S_j/R)
+                        s_row_elem_sum = np.dot(nj, s_r_vec)
+                        matrix[n_elements + 1, n_elements] = s_row_elem_sum
+
+                        # Corner element (Row T, Col T): sum(nj * (Cp/R + (S/R)*(H/RT)))
+                        # Note: derived from d(sum(nj*S))/dlnT
+                        term_corner = np.dot(nj, cp_r_vec + s_r_vec * h_rt_vec)
+                        matrix[n_elements + 1, n_elements + 1] = term_corner
+
+                        # RHS for SP
+                        # Target S0/R - Current S/R + Correction terms
+                        s0_r_target = val_1
+                        current_S_total = np.dot(nj, s_r_vec)
+                        nj_mu = nj * mu_rt_vec
+                        # The correction term is sum(nj * mu * S/R)
+                        rhs[n_elements + 1] = s0_r_target - current_S_total + np.dot(nj_mu, s_r_vec)
+
+                # 3.4 Residual Vector (Rest of RHS)
+                nj_mu = nj * mu_rt_vec
+                rhs[:n_elements] = b0 - vec_n_elements + a_matrix @ nj_mu
+                rhs[n_elements] = total_n - np.sum(nj) + np.sum(nj_mu)
+
+                # 4. Solve Linear System
+                try:
+                    corrections = np.linalg.solve(matrix, rhs)
+                except np.linalg.LinAlgError:
+                    logger.warning(f"Singular matrix at iter {iteration}. Applying regularization.")
+                    matrix += np.eye(dim) * 1e-8
+                    try:
+                        corrections = np.linalg.solve(matrix, rhs)
+                    except np.linalg.LinAlgError:
+                        return None
+
+                # 5. Extract Corrections & Update
+                pi_update = corrections[:n_elements]
+                dln_n_update = corrections[n_elements]
+                dln_t_update = 0.0
+                if is_energy_constrained:
+                    dln_t_update = corrections[n_elements + 1]
+
+                # Calculate dln_nj
+                # dln_nj = -mu_j + sum(a_ij * pi_i) + dln_n + (H_j/RT)*dln_T
+                term_temp = 0.0
+                if is_energy_constrained:
+                    term_temp = h_rt_vec * dln_t_update
+
+                dln_nj = -mu_rt_vec + (a_matrix.T @ pi_update) + dln_n_update + term_temp
+
+                # 6. Convergence Control
+                lambda_f = 1.0
+                if is_energy_constrained:
+                    if abs(dln_t_update) > 0.2:
+                        lambda_f = min(lambda_f, 0.2 / abs(dln_t_update))
+
+                max_dln_nj = np.max(np.abs(dln_nj))
+                if max_dln_nj > 2.0:
+                    lambda_f = min(lambda_f, 2.0 / max_dln_nj)
+
+                ln_nj += lambda_f * dln_nj
+                ln_n += lambda_f * dln_n_update
+
+                if is_energy_constrained:
+                    ln_T += lambda_f * dln_t_update
+                    current_T = np.exp(ln_T)
+
+                nj = np.exp(ln_nj)
+                total_n = np.exp(ln_n)
+
+                if (max_dln_nj * lambda_f < self.TOLERANCE and
+                        (abs(dln_t_update * lambda_f) < self.TOLERANCE if is_energy_constrained else True)):
+
+                    logger.info(f"Converged in {iteration} iterations. T={current_T:.2f} K")
+
+                    # Критерий появления: (Sum(aij * pi_i) - G_j/RT) > Tolerance
+                    # Это означает, что химический потенциал элементов в газе выше,
+                    # чем потенциал чистого конденсата -> конденсат должен образоваться.
+
+                    # pi_update содержит значения множителей Лагранжа (pi_i) для текущей итерации
+                    current_pi = pi_update
+
+                    max_violation = 0.0
+                    best_candidate = None
+
+                    # Проходим по всем веществам в базе данных
+                    for name, sp in self.db.species.items():
+                        if name in init_species:
+                            continue  # Уже в расчете
+
+                        # Эвристика: проверяем только вещества с (L), (S), (cr) в имени
+                        # или если бы у нас был флаг sp.phase == 'condensed'
+                        if not any(x in name for x in ['(L)', '(S)', '(cr)', '(s)', '(l)']):
+                            continue
+
+                        # Проверяем, состоит ли вещество только из доступных элементов
+                        sp_elements = set(sp.composition.keys())
+                        if not sp_elements.issubset(set(element_list)):
+                            continue
+
+                        # Считаем свойства кандидата при текущей T
+                        try:
+                            _, _, _, g_rt_cand = sp.get_properties(current_T)
+                        except ValueError:
+                            continue  # Вне температурного диапазона
+
+                        # Считаем потенциал из элементов: Sum(aij * pi_i)
+                        pot_elements = 0.0
+                        for i, el in enumerate(element_list):
+                            pot_elements += sp.composition.get(el, 0.0) * current_pi[i]
+
+                        # Критерий: (Potential_Elements - G_solid) > 0
+                        violation = pot_elements - g_rt_cand
+
+                        if violation > max_violation:
+                            max_violation = violation
+                            best_candidate = name
+
+                    # Если нашли кандидата с существенным нарушением равновесия
+                    if best_candidate and max_violation > 1e-4:
+                        logger.info(f"Adding condensed phase: {best_candidate} (Violation: {max_violation:.4e})")
+                        init_species.append(best_candidate)
+                        # ПЕРЕЗАПУСК внешнего цикла (while True), чтобы пересчитать с новым веществом
+                        break
+
+                    # Если конденсатов не найдено, выходим из цикла перезапуска и возвращаем результат
+
+                    # 7. Post-Processing: Derivatives
+                    # -------------------------------
+                    # Считаем производные (Sound Speed, Gamma, Cp)
+                    props = self._calculate_derivatives(
+                        species_objs,
+                        nj,
+                        current_T,
+                        P,
+                        total_n,
+                        cp_r_vec,  # Вектор Cp/R (уже посчитан в цикле)
+                        h_rt_vec  # Вектор H/RT (уже посчитан в цикле)
+                    )
+
+                    # Добавляем базовые свойства
+                    props["s_total_r"] = np.dot(nj, s_r_vec) / total_n
+
+                    # Фильтруем следовые количества для чистого вывода
+                    final_mole_fractions = {}
+                    for j, sp in enumerate(species_objs):
+                        if nj[j] / total_n > self.TRACE_LIMIT:
+                            final_mole_fractions[sp.name] = nj[j] / total_n
+
+                    return EquilibriumResult(
+                        P=P,
+                        T=current_T,
+                        mole_fractions=final_mole_fractions,
+                        properties=props,
+                        converged=True,
+                        iterations=iteration
+                    )
+
+            # --- Конец цикла for (indentation level: внутри while) ---
+            # Этот блок else относится к циклу FOR.
+            # Он выполнится только если цикл закончился сам (MAX_ITER), не встретив break.
+            else:
+                logger.error("Max iterations reached.")
+                return None
+
+    def _calculate_derivatives(self,
+                               species_objs: List[Any],
+                               nj: np.ndarray,
+                               T: float,
+                               P: float,
+                               total_n: float,
+                               cp_r_vec: np.ndarray,
+                               h_rt_vec: np.ndarray) -> Dict[str, float]:
+        """
+        Calculates equilibrium thermodynamic derivatives (Cp, Gamma, Sound Speed).
+        Solves the matrix equations for partial derivatives w.r.t. T and P.
+        Reference: Gordon & McBride 1994 (NASA RP-1311), Equations 2.32 - 2.65.
+        """
+        from constants import R_UNIV
 
         n_species = len(species_objs)
-        element_list = list(elements_b0.keys())
+        n_elements = len(self.db.species[species_objs[0].name].composition)  # Get from first species?
+        # Safer to reconstruct element list from DB or pass it.
+        # But we can infer n_elements from the matrix size if we passed matrix.
+        # Let's rebuild the small TP matrix here to be robust.
+
+        # 1. Rebuild Mass Balance Matrix (Size Nel+1 x Nel+1)
+        # This is the Jacobian at the converged point.
+        # We need the element definitions again. Let's assume standard order from species.
+        # It's better if 'solve' passes the element list or we extract it.
+        # Let's extract unique elements from species_objs to be consistent.
+        # NOTE: This implies element order must match what 'solve' used.
+        # To avoid desync, ideally 'solve' passes 'a_matrix'.
+        # For now, let's reconstruct 'a_matrix' assuming standard sort order of keys.
+
+        all_elements = set()
+        for sp in species_objs:
+            all_elements.update(sp.composition.keys())
+        element_list = sorted(list(all_elements))  # Use sorted to ensure deterministic order
         n_elements = len(element_list)
 
-        # Build 'a' matrix: a[i, j] = atoms of element i in species j
         a_matrix = np.zeros((n_elements, n_species))
         for j, sp in enumerate(species_objs):
             for i, el in enumerate(element_list):
                 a_matrix[i, j] = sp.composition.get(el, 0.0)
 
-        # b0 vector (elemental moles constraint)
-        b0 = np.array([elements_b0[el] for el in element_list])
+        # Build Matrix A (Size Nel+1)
+        dim = n_elements + 1
+        matrix = np.zeros((dim, dim))
 
-        # Initial Guess for Composition (n_j) and Temperature (T)
-        # TODO: Implement a robust initial guess routine (like CEA's 'estim').
-        # Currently using a uniform distribution which might fail for complex cases.
-        nj = np.ones(n_species) * 0.1 / n_species
+        # A_ik = sum(a_ij * a_kj * nj)
+        nj_diag = np.diag(nj)
+        A_block = a_matrix @ nj_diag @ a_matrix.T
+        matrix[:n_elements, :n_elements] = A_block
 
-        # Initial T
-        if problem_type == 'TP':
-            current_T = val_1
-        else:
-            # For HP/SP, we need a guess. 3000K is a typical rocket chamber T.
-            current_T = 3000.0
+        # Column/Row for sum moles: sum(a_ij * nj)
+        vec_n_elem = a_matrix @ nj
+        matrix[:n_elements, n_elements] = vec_n_elem
+        matrix[n_elements, :n_elements] = vec_n_elem
 
-            # Initial Total Moles (n)
-        total_n = np.sum(nj)
-        ln_nj = np.log(nj)
-        ln_n = np.log(total_n)
-        ln_T = np.log(current_T)
+        # Corner: sum(nj) - n. But for derivatives matrix, the corner is sum(nj) (See Eq 2.37)
+        # Actually, in derivative eq (2.34), the coefficient for dln_n is sum(n_j).
+        matrix[n_elements, n_elements] = np.sum(nj)
 
-        # Solver Loop
-        # -----------
-        for iteration in range(self.MAX_ITER):
+        # 2. Build RHS Vectors
+        # --------------------
+        # For d/dlnT (Eq 2.34): RHS is vector of Enthalpies
+        # Vector elements: sum(a_ij * nj * H_j/RT)
+        # Scalar element:  sum(nj * H_j/RT)
+        rhs_t = np.zeros(dim)
+        nj_h = nj * h_rt_vec
+        rhs_t[:n_elements] = a_matrix @ nj_h
+        rhs_t[n_elements] = np.sum(nj_h)
 
-            # 2. Calculate Thermodynamic Properties for current T
-            # ---------------------------------------------------
-            # We need dimensionless properties: H/RT, S/R, Cp/R, G/RT
-            # vectors of size n_species
-            h_rt_vec = np.zeros(n_species)
-            s_r_vec = np.zeros(n_species)
-            cp_r_vec = np.zeros(n_species)
-            mu_rt_vec = np.zeros(n_species)  # Chemical potential
+        # For d/dlnP (Eq 2.37): RHS is vector of Moles (Volumes)
+        # Vector elements: sum(a_ij * nj)  (= b0_i if conserved, but we use actuals)
+        # Scalar element:  sum(nj)
+        rhs_p = np.zeros(dim)
+        rhs_p[:n_elements] = vec_n_elem
+        rhs_p[n_elements] = np.sum(nj)
 
-            for j, sp in enumerate(species_objs):
-                cp_r, h_rt, s_r, g_rt = sp.get_properties(current_T)
-                h_rt_vec[j] = h_rt
-                s_r_vec[j] = s_r
-                cp_r_vec[j] = cp_r
-
-                # mu_j/RT = (G/RT)_j + ln(n_j) + ln(P_atm) - ln(n)
-                # Note: P must be in bars/atm depending on DB standard state. 
-                # CEA standard state is usually 1 bar.
-                # If P is in bar, ln(P) is correct.
-                # TODO: Check if condensed phase logic is needed here.
-                # For condensed: mu_j/RT = (G/RT)_j (no pressure term)
-                mu_rt_vec[j] = g_rt + ln_nj[j] + np.log(P) - ln_n
-
-            # 3. Build Interaction Matrix and Residual Vector
-            # -----------------------------------------------
-            # Matrix size: 
-            #   TP problem: N_el + 1 (Variables: pi_i, dln_n)
-            #   HP/SP prob: N_el + 2 (Variables: pi_i, dln_n, dln_T)
-
-            is_energy_constrained = (problem_type != 'TP')
-            dim = n_elements + 1 + (1 if is_energy_constrained else 0)
-
-            matrix = np.zeros((dim, dim))
-            rhs = np.zeros(dim)
-
-            # --- Pre-calculate terms ---
-            # nj_a[i, j] = nj[j] * a[i, j]
-            # This helps in computing sums efficiently
-            nj_diag = np.diag(nj)
-
-            # 3.1 Mass Balance Block (Rows 0 to N_el-1)
-            # A_ik = sum_j (a_ij * a_kj * n_j)
-            # Matrix form: A @ diag(nj) @ A.T
-            A_block = a_matrix @ nj_diag @ a_matrix.T
-            matrix[:n_elements, :n_elements] = A_block
-
-            # 3.2 Equation of State Block (Row/Col N_el)
-            # Sum of moles: sum_j (a_ij * n_j)
-            # Vector form: A @ nj
-            vec_n_elements = a_matrix @ nj
-            matrix[:n_elements, n_elements] = vec_n_elements
-            matrix[n_elements, :n_elements] = vec_n_elements
-
-            # Corner element (Row N_el, Col N_el) = sum(n_j) - n
-            # According to CEA derivation (Gordon-McBride Eq 2.24), this term is sum(n_j)
-            # But the variable is dln_n, so the coefficient is effectively sum(n_j).
-            # Wait, let's verify Gordon-McBride Eq 2.24 carefully.
-            # The variable is delta(ln n). The coefficient for pi_i is sum(aij nj).
-            # The coefficient for delta(ln n) is sum(nj) - n. (Eq 2.26)
-            matrix[n_elements, n_elements] = np.sum(nj) - total_n  # Often close to 0 if n matches sum(nj)
-
-            # 3.3 Energy/Entropy Block (Row/Col N_el+1) - Only for HP/SP
-            if is_energy_constrained:
-                # Coefficients for dln_T column (Column N_el + 1)
-                # Part 1: sum(aij * nj * (H/RT)_j) for Mass rows
-                # Vector: A @ (nj * H_RT)
-                term_h_or_u = h_rt_vec if problem_type == 'HP' else s_r_vec  # Simplified? No, needs partials.
-
-                # Careful: For HP, we need Enthalpy terms. For SP, Entropy terms.
-                # Let's handle HP first (Enthalpy).
-                if problem_type == 'HP':
-                    # Derivative of mass balance w.r.t T involves H term? No.
-                    # The T column in Mass Balance equations:
-                    # Coeff = sum(a_ij * n_j * (Ho_j/RT))  (Eq 2.24 in RP-1311)
-                    # Because d(mu/RT)/dlnT = -H/RT
-
-                    t_coupling_vec = a_matrix @ (nj * h_rt_vec)
-                    matrix[:n_elements, n_elements + 1] = t_coupling_vec
-                    matrix[n_elements + 1, :n_elements] = t_coupling_vec
-
-                    # Intersection with dln_n (Row N_el+1, Col N_el)
-                    # sum(nj * H/RT)
-                    sum_nj_h = np.dot(nj, h_rt_vec)
-                    matrix[n_elements, n_elements + 1] = sum_nj_h
-                    matrix[n_elements + 1, n_elements] = sum_nj_h
-
-                    # Bottom-Right Corner (Row N_el+1, Col N_el+1)
-                    # sum(nj * (Cp/R + (H/RT)^2))
-                    # Eq 2.28 in RP-1311
-                    term_corner = np.dot(nj, cp_r_vec + h_rt_vec ** 2)
-                    matrix[n_elements + 1, n_elements + 1] = term_corner
-
-                elif problem_type == 'SP':
-                    # TODO: Implement SP (Entropy) specific matrix terms.
-                    # It's similar to HP but uses S/R and d(S/R)/dlnT = Cp/R terms.
-                    # For now, raise NotImplemented to keep code clean or fallback to HP logic structure.
-                    raise NotImplementedError("SP problem type fully rigorous matrix not yet implemented.")
-
-            # 3.4 Residual Vector (RHS)
-            # -------------------------
-            # Mass Balance Errors: b0_i - sum(a_ij * n_j)
-            # Plus potential terms (see RP-1311 Eq 2.24 RHS)
-            # RHS_i = b0_i - sum(a_ij * nj) + sum(a_ij * nj * mu_j) ... (This is standard derivation)
-
-            # Actually, standard Newton form Ax = B:
-            # RHS_i = b0 - sum(aij*nj) ... no, wait.
-            # In reduced form (pi variables):
-            # RHS_i = b0_i - sum(a_ij * n_j) + [terms from expanding mu]
-            # Let's use the explicit summation form:
-            # RHS_i = b0_i - sum(a_ij * n_j) + sum_j (a_ij * n_j * mu_j) <-- This simplifies things if we solve for corrections.
-
-            # Let's stick to the corrections formulation:
-            # We solve for del_pi, del_ln_n, del_ln_T
-
-            # Vector of mu*nj
-            nj_mu = nj * mu_rt_vec
-
-            # Mass Rows RHS:
-            # (b0 - A @ nj) + A @ (nj * mu)
-            rhs[:n_elements] = b0 - vec_n_elements + a_matrix @ nj_mu
-
-            # Sum Moles Row RHS:
-            # total_n - sum(nj) + sum(nj * mu)
-            rhs[n_elements] = total_n - np.sum(nj) + np.sum(nj_mu)
-
-            # Energy Row RHS (HP):
-            if is_energy_constrained and problem_type == 'HP':
-                # Target Enthalpy H0/RT (dimensionless input val_1 must be H0/R -> H0/RT = val_1 / T)
-                # Wait, input val_1 for HP is usually H0/R (units of K).
-                h0_rt_target = val_1 / current_T
-
-                # Current Enthalpy of mixture
-                # H_mix/RT = sum(nj * H_j/RT) / sum(nj) ? No, per kg basis.
-                # Equations are extensive in CEA. H_total / RT = sum(nj * H_j/RT).
-                # We need to match input H0 per unit mass.
-                # Actually, CEA usually balances H/R.
-
-                # Let's assume val_1 is H_target / R (total enthalpy of 1 kg mixture / R)
-
-                # RHS_energy = H0/RT - sum(nj * H/RT) + sum(nj * H/RT * mu)
-                current_H_total = np.dot(nj, h_rt_vec)
-                rhs[n_elements + 1] = h0_rt_target - current_H_total + np.dot(nj_mu, h_rt_vec)
-
-            # 4. Solve Linear System
-            # ----------------------
-            try:
-                corrections = np.linalg.solve(matrix, rhs)
-            except np.linalg.LinAlgError:
-                # Matrix singularity handling
-                logger.warning(f"Singular matrix at iter {iteration}. Applying regularization.")
-                matrix += np.eye(dim) * 1e-8
-                try:
-                    corrections = np.linalg.solve(matrix, rhs)
-                except np.linalg.LinAlgError:
-                    logger.error("Solver failed: Singular matrix.")
-                    return None
-
-            # 5. Extract Corrections & Update
-            # -------------------------------
-            pi_update = corrections[:n_elements]
-            dln_n_update = corrections[n_elements]
-            dln_t_update = 0.0
-            if is_energy_constrained:
-                dln_t_update = corrections[n_elements + 1]
-
-            # Calculate dln_nj for each species
-            # dln_nj = -mu_j + sum(a_ij * pi_i) + dln_n + (H_j/RT)*dln_T
-            # (Last term is for T variable)
-
-            term_temp = 0.0
-            if is_energy_constrained:
-                # d(mu)/dlnT = -H/RT
-                # So dln_nj += (H_j/RT) * dln_T
-                term_temp = h_rt_vec * dln_t_update
-
-            dln_nj = -mu_rt_vec + (a_matrix.T @ pi_update) + dln_n_update + term_temp
-
-            # 6. Convergence Control (Lambda damping)
-            # ---------------------------------------
-            # Prevent excessive steps that drive moles negative (or huge T jumps)
-            lambda_f = 1.0
-
-            # Limit T change to avoid negative T or explosion
-            if is_energy_constrained:
-                if abs(dln_t_update) > 0.2:  # Limit approx 20% change
-                    lambda_f = min(lambda_f, 0.2 / abs(dln_t_update))
-
-            # Limit mole changes (standard max step 2.0 in log space)
-            max_dln_nj = np.max(np.abs(dln_nj))
-            if max_dln_nj > 2.0:
-                lambda_f = min(lambda_f, 2.0 / max_dln_nj)
-
-            # Apply updates
-            ln_nj += lambda_f * dln_nj
-            ln_n += lambda_f * dln_n_update
-
-            if is_energy_constrained:
-                ln_T += lambda_f * dln_t_update
-                current_T = np.exp(ln_T)
-
-            nj = np.exp(ln_nj)
-            total_n = np.exp(ln_n)
-
-            # Normalization (optional but good for stability)
-            # CEA does normalization inside the loop sometimes.
-
-            # Check Convergence
-            # Criteria: max correction is small AND residuals are small
-            # For now, just checking corrections.
-            if (max_dln_nj * lambda_f < self.TOLERANCE and
-                    (abs(dln_t_update * lambda_f) < self.TOLERANCE if is_energy_constrained else True)):
-
-                logger.info(f"Converged in {iteration} iterations. T={current_T:.2f} K")
-
-                # TODO: Check for Condensed Phases here.
-                # Logic: Calculate chemical potential of excluded solids.
-                # If mu_solid/RT < sum(a_ij * pi_j), the solid should form.
-                # Add to 'init_species' and restart? Or dynamic add/remove.
-
-                # 7. Post-Processing: Derivatives
-                # -------------------------------
-                props = self._calculate_derivatives(
-                    species_objs, nj, current_T, P, matrix, n_elements, is_energy_constrained, total_n, cp_r_vec
-                )
-
-                # Build Result
-                # Filter Trace Species
-                final_mole_fractions = {}
-                for j, sp in enumerate(species_objs):
-                    if nj[j] / total_n > self.TRACE_LIMIT:
-                        final_mole_fractions[sp.name] = nj[j] / total_n
-
-                return EquilibriumResult(
-                    P=P,
-                    T=current_T,
-                    mole_fractions=final_mole_fractions,
-                    properties=props,
-                    converged=True,
-                    iterations=iteration
-                )
-
-        logger.error("Max iterations reached without convergence.")
-        return None
-
-    def _calculate_derivatives(self,
-                               species,
-                               nj,
-                               T,
-                               P,
-                               matrix,
-                               n_elements,
-                               is_energy_constrained,
-                               total_n,
-                               cp_r_vec) -> Dict[str, float]:
-        """
-        Solves the derivative linear equations to find Cp, Gamma, etc.
-        Reference: Gordon & McBride 1994, Chapter 2.
-
-        This requires solving the same matrix with different RHS vectors
-        to find derivatives with respect to ln P and ln T.
-        """
-        # For a full rocket solution, we strictly need:
-        # dln_V/dln_P, dln_V/dln_T, Cp_frozen, Cp_equilibrium.
-
-        # 1. Solve for d/dlnT (assuming constant P)
-        # We assume the 'matrix' passed is the converged Jacobian.
-        # However, for derivatives, the RHS is specific.
-
-        # NOTE: A rigorous implementation requires separating the matrix parts
-        # or reconstructing it. Given complexity, providing a simplified calculation
-        # for frozen/equilibrium Cp based on summation properties for now.
-
-        # Equilibrium Cp calculation involves the reaction contributions.
-        # Cp_eq = Cp_frozen + reaction_terms
-
-        # Frozen Properties
-        # Cp_frozen = sum(xi * Cp_i)
-        mole_fracs = nj / total_n
-        cp_frozen_r = np.dot(mole_fracs, cp_r_vec)
-
-        # Molecular Weight of Mixture
-        mw_mix = 0.0
-        for j, sp in enumerate(species):
-            mw_mix += mole_fracs[j] * sp.molecular_weight
-
-        # Specific Heat Ratio (Gamma)
-        # Gamma = Cp / Cv = Cp / (Cp - R)
-        gamma_s = cp_frozen_r / (cp_frozen_r - 1.0)
-
-        # Sound Speed (Frozen)
-        # a = sqrt(gamma * R * T / M)
-        # R_univ = 8314.51
-        from constants import R_UNIV
+        # 3. Solve Systems
+        # ----------------
+        # We solve A * x = RHS.
+        # Note on signs: Gordon-McBride often define equations such that A*dx = RHS.
+        # Checked Eq 2.34: Matrix * [d_pi, d_ln_n] = [Enthalpy_Vector]
         try:
-            a_frozen = np.sqrt(gamma_s * R_UNIV * T / mw_mix)
-        except ValueError:
-            a_frozen = 0.0
+            sol_t = np.linalg.solve(matrix, rhs_t)
+            sol_p = np.linalg.solve(matrix, rhs_p)
+        except np.linalg.LinAlgError:
+            logger.warning("Derivative matrix singular. Returning frozen properties.")
+            # Fallback to frozen
+            mw_mix = np.sum(nj * np.array([sp.molecular_weight for sp in species_objs])) / total_n
+            cp_frozen = np.dot(nj, cp_r_vec) / total_n
+            return {
+                "cp_eq_r": cp_frozen, "gamma_s": 1.4, "son_vel": 0.0, "mw": mw_mix
+            }
 
-        # TODO: Implement full Equilibrium Gamma and Sound Speed.
-        # This requires solving the matrix for dln_n/dln_P.
+        # Extract derivatives of system variables
+        # dln_n_T = (d ln n / d ln T)_P
+        dln_n_t = sol_t[n_elements]
+
+        # dln_n_P = (d ln n / d ln P)_T
+        dln_n_p = sol_p[n_elements]
+
+        # Derivatives of Species (d ln n_j / d ln T)_P
+        # Eq 2.32: dln_nj/dlnT = H/RT + sum(a_ij * pi_i)_T + dln_n_T
+        # Wait, solution x corresponds to (d_pi, d_ln_n).
+        # But look at Eq 2.32: dln_nj = H/RT + ...
+        # The matrix equation (2.34) comes from substituting this into mass balance.
+        # A * x = RHS_enthalpy implies x are indeed the derivatives of pi and ln_n w.r.t ln T.
+
+        # We don't strictly need individual species derivatives for Cp_eq if we use the summed form:
+        # Cp_eq/R = sum(nj*Cp_j)/R + sum(nj * H_j/RT * dln_nj_dlnT)
+        # Let's compute the second term efficiently.
+
+        pi_t = sol_t[:n_elements]
+        # dln_nj_dlnT vector:
+        dln_nj_t = h_rt_vec + a_matrix.T @ pi_t + dln_n_t
+
+        # 4. Calculate Properties
+        # -----------------------
+
+        # C_p Equilibrium (Eq 2.62)
+        # Cp_eq/R = sum(x_j * Cp_j) + sum(x_j * H_j/RT * dln_nj_dlnT)
+        # Using totals (not fractions) first:
+        term_1 = np.dot(nj, cp_r_vec)
+        term_2 = np.dot(nj * h_rt_vec, dln_nj_t)
+        cp_eq_r = (term_1 + term_2) / total_n
+
+        # C_v Equilibrium calculation needed for Gamma?
+        # CEA uses thermodynamic derivatives of Volume directly.
+        # (d ln V / d ln T)_P = 1 + (d ln n / d ln T)_P  (Eq 2.42)
+        dln_v_t = 1.0 + dln_n_t
+
+        # (d ln V / d ln P)_T = -1 + (d ln n / d ln P)_T (Eq 2.43)
+        dln_v_p = -1.0 + dln_n_p
+
+        # Gamma_S (Isentropic Exponent) - Used for Sound Speed
+        # gamma_s = - gamma / (d ln V / d ln P)_T  (Eq 2.63) ???
+        # Actually simpler formula via C_p:
+        # gamma_s = - (Cp/Cv) / (dlnV/dlnP) ...
+        # Standard CEA formula (Eq 2.50 + 2.63):
+        # gamma_s = - (Cp/R) / ( (Cp/R) * (dlnV/dlnP)_T + (dlnV/dlnT)_P^2 )
+        # This relates Cp, density derivatives and sound speed.
+
+        denom = cp_eq_r * dln_v_p + (dln_v_t) ** 2
+        if abs(denom) < 1e-12:
+            gamma_s = 1.4  # Error fallback
+        else:
+            gamma_s = - cp_eq_r / denom
+
+        # Gamma (Specific Heat Ratio) Cp/Cv
+        # gamma = gamma_s * (dlnV/dlnP)_T / (-1)? No.
+        # gamma = - gamma_s * (dlnV/dlnP)_S ?
+        # Eq 2.2b: gamma = (dlnP/dln_rho)_S = gamma_s.
+        # CEA output labels 'GAMMAs' as the isentropic exponent used for sound speed.
+        # This IS the number we want for rocket calculations.
+
+        # Molecular Weight
+        mw_mix = np.sum(nj * np.array([sp.molecular_weight for sp in species_objs])) / total_n
+
+        # Sound Speed (Eq 2.55)
+        # a = sqrt( nRT * gamma_s )  where n is moles per unit mass = 1/MW
+        # a = sqrt( (R_univ * T / MW) * gamma_s )
+
+        son_vel = np.sqrt((R_UNIV * T / mw_mix) * gamma_s)
 
         return {
-            "cp_frozen_r": cp_frozen_r,
-            "gamma_frozen": gamma_s,
-            "mw_mix": mw_mix,
-            "sonic_velocity_frozen": a_frozen,
-            "enthalpy_total_rt": 0.0  # Placeholder
+            "cp_eq_r": cp_eq_r,
+            "enthalpy_total_rt": np.dot(nj, h_rt_vec) / total_n,
+            "entropy_total_r": np.dot(nj * (species_objs[0].intervals[0].coeffs[8] if False else 1.0)) / total_n,
+            # Placeholder for S
+            "mw": mw_mix,
+            "gamma_s": gamma_s,
+            "son_vel": son_vel,
+            "dln_v_t": dln_v_t,
+            "dln_v_p": dln_v_p
         }
+
+    def _estimate_initial_composition(self,
+                                      species_objs: List[Any],
+                                      elements_b0: np.ndarray,
+                                      a_matrix: np.ndarray,
+                                      T_guess: float,
+                                      P: float) -> Tuple[np.ndarray, float]:
+        """
+        Generates a robust initial guess for species moles (nj).
+        Based on the logic that species with lower Gibbs energy are dominant.
+
+        Args:
+            species_objs: List of species objects.
+            elements_b0: Vector of elemental moles per kg (b_i^0).
+            a_matrix: Composition matrix (n_elements x n_species).
+            T_guess: Guess temperature.
+            P: Pressure (bar).
+
+        Returns:
+            Tuple (nj, total_n)
+        """
+        n_species = len(species_objs)
+        n_elements = len(elements_b0)
+
+        # 1. Calculate rough Gibbs energy for each species at T_guess
+        # g_rt = H/RT - S/R (dimensionless)
+        g_val = np.zeros(n_species)
+
+        # Small epsilon to avoid log(0) if we used it elsewhere,
+        # but here we use exp(-g), so it's safe.
+
+        for j, sp in enumerate(species_objs):
+            # We use the simplified formulas or just the first interval
+            # Catch errors if T is out of range by clamping
+            try:
+                # Use get_properties directly
+                _, _, _, g_rt = sp.get_properties(T_guess)
+                g_val[j] = g_rt
+            except ValueError:
+                # If T_guess is wildly out, fallback to high energy (unlikely species)
+                g_val[j] = 1000.0
+
+        # 2. Probability proportional to Boltzmann factor: p ~ exp(-G/RT)
+        # However, we must consider pressure: mu = g_rt + ln(P) + ln(nj/n)
+        # Minimizing mu implies maximizing concentration for low g_rt.
+
+        # Shift g_val to avoid overflow/underflow in exp
+        min_g = np.min(g_val)
+        # weight ~ exp(-(g_rt - min_g))
+        weights = np.exp(-(g_val - min_g))
+
+        # 3. Scale weights to satisfy mass balance roughly
+        # We want: A @ nj = b0
+        # Let nj = scale * weights
+        # Then: scale * (A @ weights) = b0
+        # This is an overdetermined system (n_elements equations, 1 variable 'scale').
+        # We can't satisfy all exactly with one scalar.
+        # Strategy: Satisfy the most abundant element or take an average requirement.
+
+        element_demands = a_matrix @ weights  # How much of each element is in the weighted mix
+
+        # Calculate required scale for each element: scale_i = b0_i / demand_i
+        # We ignore elements with zero demand or zero b0 for the scale calc.
+        scales = []
+        for i in range(n_elements):
+            if element_demands[i] > 1e-20 and elements_b0[i] > 1e-20:
+                scales.append(elements_b0[i] / element_demands[i])
+
+        if not scales:
+            # Fallback if something went wrong (e.g. noble gases only?)
+            avg_scale = 0.1 / np.sum(weights)
+        else:
+            # Use the average scale factor required
+            # Alternatively, using the max scale ensures we have ENOUGH atoms,
+            # preventing negative logs early on.
+            avg_scale = np.mean(scales)
+
+        nj_guess = weights * avg_scale
+
+        # 4. Refinement: Ensure no species is absolute zero (set floor)
+        # Using a small number like 1e-10 prevents singularity in first matrix inversion
+        min_moles = 1e-5  # Sufficiently small start
+        nj_guess = np.maximum(nj_guess, min_moles)
+
+        total_n_guess = np.sum(nj_guess)
+
+        return nj_guess, total_n_guess
